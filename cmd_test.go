@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows
 
 package cmd_test
 
@@ -186,7 +186,7 @@ func TestCmdNotStarted(t *testing.T) {
 	}
 
 	err := p.Stop()
-	if err != nil {
+	if err != cmd.ErrNotStarted {
 		t.Error(err)
 	}
 }
@@ -271,6 +271,7 @@ func TestCmdNotFound(t *testing.T) {
 		Stdout:   nil,
 		Stderr:   nil,
 	}
+	t.Logf("%v", gotStatus)
 	if diffs := deep.Equal(gotStatus, expectStatus); diffs != nil {
 		t.Logf("%+v", gotStatus)
 		t.Error(diffs)
@@ -353,7 +354,7 @@ func TestCmdBothOutput(t *testing.T) {
 	//   stdout 2
 	//   stderr 2
 	// Where each is printed on stdout and stderr as indicated.
-	p := cmd.NewCmdOptions(cmd.Options{Buffered: true, Streaming: true}, "./test/stream", tmpfile.Name())
+	p := cmd.NewCmdOptions(cmd.Options{Buffered: true, CombinedOutput: false, Streaming: true}, "./test/stream", tmpfile.Name())
 	p.Start()
 	time.Sleep(250 * time.Millisecond) // give test/stream a moment to print something
 
@@ -437,6 +438,206 @@ func TestCmdBothOutput(t *testing.T) {
 	}
 }
 
+func TestCmdCombinedOutputOnly(t *testing.T) {
+	tmpfile, err := ioutil.TempFile("", "cmd.TestCmdCombinedOutputOnly")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+	if err := tmpfile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("temp file: %s", tmpfile.Name())
+	os.Remove(tmpfile.Name())
+
+	p := cmd.NewCmdOptions(cmd.Options{Buffered: false, CombinedOutput: true, Streaming: false}, "./test/touch-file-count-combined", tmpfile.Name())
+
+	p.Start()
+
+	touchFile := func(file string) {
+		if err := exec.Command("touch", file).Run(); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(600 * time.Millisecond)
+	}
+	var s cmd.Status
+	var stdout []string
+	var stderr []string //creating nil slice and cmd.Stderr should always be nil in combined
+
+	touchFile(tmpfile.Name())
+	s = p.Status()
+	stdout = []string{"1", "1"}
+	t.Log(s.Stdout)
+	if diffs := deep.Equal(s.Stdout, stdout); diffs != nil {
+		t.Log(s.Stdout)
+		t.Error(diffs)
+	}
+	if diffs := deep.Equal(s.Stderr, stderr); diffs != nil {
+		t.Log(s.Stderr)
+		t.Error(diffs)
+	}
+
+	touchFile(tmpfile.Name())
+	s = p.Status()
+	stdout = []string{"1", "1", "2", "2"}
+	t.Log(s.Stdout)
+	if diffs := deep.Equal(s.Stdout, stdout); diffs != nil {
+		t.Log(s.Stdout)
+		t.Error(diffs)
+	}
+	if diffs := deep.Equal(s.Stderr, stderr); diffs != nil {
+		t.Log(s.Stderr)
+		t.Error(diffs)
+	}
+
+	// No more output yet
+	s = p.Status()
+	stdout = []string{"1", "1", "2", "2"}
+	t.Log(s.Stdout)
+	if diffs := deep.Equal(s.Stdout, stdout); diffs != nil {
+		t.Log(s.Stdout)
+		t.Error(diffs)
+	}
+	if diffs := deep.Equal(s.Stderr, stderr); diffs != nil {
+		t.Log(s.Stderr)
+		t.Error(diffs)
+	}
+
+	// +2 lines
+	touchFile(tmpfile.Name())
+	touchFile(tmpfile.Name())
+	s = p.Status()
+	stdout = []string{"1", "1", "2", "2", "3", "3", "4", "4"}
+	if diffs := deep.Equal(s.Stdout, stdout); diffs != nil {
+		t.Log(s.Stdout)
+		t.Error(diffs)
+	}
+	if diffs := deep.Equal(s.Stderr, stderr); diffs != nil {
+		t.Log(s.Stderr)
+		t.Error(diffs)
+	}
+
+	// Kill the process
+	if err := p.Stop(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestCmdBothCombinedStreamOutput(t *testing.T) {
+	//This tests the buffered combined
+
+	tmpfile, err := ioutil.TempFile("", "cmd.TestCombinedOutput")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+	if err := tmpfile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(tmpfile.Name()); err != nil {
+		t.Fatal(err)
+	}
+
+	touchFile := func(file string) {
+		if err := exec.Command("touch", file).Run(); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Streams a count to stdout and stderr until given file exists
+	// Output like:
+	//   stdout 1
+	//   stderr 1
+	//   stdout 2
+	//   stderr 2
+	// Where each is printed on stdout and stderr as indicated.
+	p := cmd.NewCmdOptions(cmd.Options{Buffered: false, CombinedOutput: true, Streaming: true}, "./test/stream", tmpfile.Name())
+	p.Start()
+	time.Sleep(250 * time.Millisecond) // give test/stream a moment to print something
+
+	timeout := time.After(10 * time.Second) // test timeout
+
+	// test/stream is spewing output, so we should be able to read it while
+	// the cmd is running. Try and fetch 3 lines from stdout and stderr.
+	i := 0
+	stdoutPrevLine := ""
+	stderrPrevLine := ""
+	readLines := 3
+	lines := 0
+	for i < readLines {
+		i++
+
+		// STDOUT should be getting STDERR as well
+		select {
+		case curLine := <-p.Stdout:
+			t.Logf("got line: '%s'", curLine)
+			if curLine == "" {
+				// Shouldn't happen because test/stream doesn't print empty lines.
+				// This indicates a bug in the stream buffer handling.
+				t.Fatal("got empty line")
+			}
+			if stdoutPrevLine != "" && curLine == stdoutPrevLine {
+				t.Fatalf("current line == previous line, expected new output:\ncprev: %s\ncur: %s\n", stdoutPrevLine, curLine)
+			}
+			stdoutPrevLine = curLine
+			lines++
+		case <-timeout:
+			t.Fatal("timeout reading streaming output")
+		default:
+		}
+
+		// STDERR
+		select {
+		case curLine := <-p.Stderr:
+			t.Logf("got line: '%s'", curLine)
+			if curLine == "" {
+				// Shouldn't happen because test/stream doesn't print empty lines.
+				// This indicates a bug in the stream buffer handling.
+				t.Fatal("got empty line")
+			}
+			if stderrPrevLine != "" && curLine == stderrPrevLine {
+				t.Fatalf("current line == previous line, expected new output:\ncprev: %s\ncur: %s\n", stderrPrevLine, curLine)
+			}
+			stderrPrevLine = curLine
+			lines++
+		case <-timeout:
+			t.Fatal("timeout reading streaming output")
+		default:
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// readLines * 2 (stdout and stderr)
+	if lines != readLines*2 {
+		t.Fatalf("read %d lines from streaming output, expected 6", lines)
+	}
+
+	s := p.Status()
+	//stdout should have both stdout and stderr output
+	if len(s.Stdout) < readLines*2 {
+		t.Fatalf("read %d lines from buffered STDOUT, expected %d", len(s.Stdout), readLines)
+	}
+	//stderr should be empty
+	if len(s.Stderr) != 0 {
+		t.Fatalf("read %d lines from buffered STDERR, expected %d", len(s.Stderr), readLines)
+	}
+
+	// Stop test/stream
+	touchFile(tmpfile.Name())
+
+	s = p.Status()
+	if s.Exit != 0 {
+		t.Errorf("got exit %d, expected 0", s.Exit)
+	}
+
+	// Kill the process
+	if err := p.Stop(); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestCmdOnlyStreamingOutput(t *testing.T) {
 	tmpfile, err := ioutil.TempFile("", "cmd.TestStreamingOutput")
 	if err != nil {
@@ -464,7 +665,7 @@ func TestCmdOnlyStreamingOutput(t *testing.T) {
 	//   stdout 2
 	//   stderr 2
 	// Where each is printed on stdout and stderr as indicated.
-	p := cmd.NewCmdOptions(cmd.Options{Buffered: false, Streaming: true}, "./test/stream", tmpfile.Name())
+	p := cmd.NewCmdOptions(cmd.Options{Buffered: false, CombinedOutput: false, Streaming: true}, "./test/stream", tmpfile.Name())
 	p.Start()
 	time.Sleep(250 * time.Millisecond) // give test/stream a moment to print something
 
@@ -1126,4 +1327,185 @@ func TestStdinOk(t *testing.T) {
 			t.Errorf("got runtime %f, expected non-zero", gotStatus.Runtime)
 		}
 	}
+}
+
+func TestOptionsBeforeExec(t *testing.T) {
+	handled := false
+	p := cmd.NewCmdOptions(
+		cmd.Options{
+			BeforeExec: []func(cmd *exec.Cmd){
+				func(cmd *exec.Cmd) { handled = true },
+			},
+		},
+		"/bin/ls",
+	)
+	<-p.Start()
+	if !handled {
+		t.Error("exec cmd option not applied")
+	}
+
+	// nil funcs should be ignored, not cause a panic
+	handled = false
+	p = cmd.NewCmdOptions(
+		cmd.Options{
+			BeforeExec: []func(cmd *exec.Cmd){
+				nil,
+				func(cmd *exec.Cmd) { handled = true },
+			},
+		},
+		"/bin/ls",
+	)
+	<-p.Start()
+	if !handled {
+		t.Error("exec cmd option not applied")
+	}
+
+	// Cloning should copy the funcs
+	handled = false
+	p2 := p.Clone()
+	<-p2.Start()
+	if !handled {
+		t.Error("exec cmd option not applied")
+	}
+}
+
+func TestOptionsBeforeExecButStopped(t *testing.T) {
+	// https://github.com/go-cmd/cmd/issues/94
+	// Bug: if cmd is stopped before BeforeExec completes, cmd still runs.
+	// To test, call Stop before BeforeExec callbacks are done and make sure
+	// the cmd is not run.
+	called := make(chan bool)
+	p := cmd.NewCmdOptions(
+		cmd.Options{
+			CombinedOutput: true,
+			BeforeExec: []func(cmd *exec.Cmd){
+				func(cmd *exec.Cmd) {
+					called <- true // let test call Stop
+					<-called       // wait for that ^
+				},
+			},
+		},
+		"/bin/ls",
+	)
+	statusChan := p.Start()
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for BeforeExec func")
+	}
+
+	err := p.Stop()
+	if err != cmd.ErrNotStarted {
+		t.Errorf("got err %v, expected cmd.ErrNotStarted", err)
+	}
+	close(called) // unblock BeforeExec func
+
+	var got cmd.Status
+	select {
+	case got = <-statusChan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for cmd to return")
+	}
+
+	t.Logf("%+v\n", got)
+	if len(got.Stdout) != 0 {
+		t.Errorf("cmd ran, expected no output: %v", got.Stdout)
+	}
+
+	// Double checking that 2nd Stop returns nil because Stop docs
+	// say "stopping an already stopped command returns nil".
+	err = p.Stop()
+	if err != nil {
+		t.Errorf("got err %v, expected nil", err)
+	}
+}
+
+func TestStopWhileStarting(t *testing.T) {
+	// Bug: if Stop is called after Start but before the system has started
+	// the command (Status.PID not set yet), Stop returns ErrNotStarted and
+	// the cmd still runs. Calling Stop again returns nil and does not kill
+	// the cmd either because the cmd is flagged stopped. To test, call Stop
+	// right after Start and make sure the cmd is not run or is killed.
+	p := cmd.NewCmd("sleep", "5")
+	statusChan := p.Start()
+
+	err := p.Stop()
+	if err != nil && err != cmd.ErrNotStarted {
+		t.Errorf("got err %v, expected nil or cmd.ErrNotStarted", err)
+	}
+
+	var got cmd.Status
+	select {
+	case got = <-statusChan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for cmd to be killed")
+	}
+
+	t.Logf("%+v\n", got)
+	if got.Complete {
+		t.Error("got Complete true, expected false")
+	}
+	if got.Exit != -1 {
+		t.Errorf("got Exit %d, expected -1", got.Exit)
+	}
+}
+
+func TestCmdLineBufferIncrease(t *testing.T) {
+	lineContent := cmd.DEFAULT_LINE_BUFFER_SIZE * 2
+	longLine := make([]byte, lineContent) // "AAA..."
+	for i := 0; i < lineContent; i++ {
+		longLine[i] = 'A'
+	}
+
+	tmpfile, err := ioutil.TempFile("", "cmd.TestCmdLineBufferIncrease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		os.Remove(tmpfile.Name())
+	})
+	if _, err := tmpfile.Write(longLine); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpfile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	timeout := time.After(10 * time.Second) // test timeout
+
+	catStdout := cmd.NewCmdOptions(cmd.Options{
+		Streaming:      true,
+		LineBufferSize: cmd.DEFAULT_LINE_BUFFER_SIZE * 2,
+	}, "./test/cat", tmpfile.Name(), "1")
+
+	catStdoutStatus := catStdout.Start()
+
+	select {
+	case curLine := <-catStdout.Stdout:
+		t.Logf("got stdout bytes: %d", len(curLine))
+		if len(curLine) <= cmd.DEFAULT_LINE_BUFFER_SIZE {
+			t.Error("Unable to read more than default line buffer from stdout")
+		}
+	case <-timeout:
+		t.Fatal("timeout reading streaming output")
+	}
+	<-catStdoutStatus
+
+	catStderr := cmd.NewCmdOptions(cmd.Options{
+		Streaming:      true,
+		LineBufferSize: cmd.DEFAULT_LINE_BUFFER_SIZE * 2,
+	}, "./test/cat", tmpfile.Name(), "2")
+
+	catStderrStatus := catStderr.Start()
+
+	select {
+	case curLine := <-catStderr.Stderr:
+		t.Logf("got stderr bytes: %d", len(curLine))
+		if len(curLine) <= cmd.DEFAULT_LINE_BUFFER_SIZE {
+			t.Error("Unable to read more than default line buffer from stderr")
+		}
+	case <-timeout:
+		t.Fatal("timeout reading streaming output")
+	}
+	<-catStderrStatus
 }
